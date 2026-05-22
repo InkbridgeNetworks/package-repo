@@ -1,0 +1,71 @@
+name: Mirror to self-hosted repo
+
+on:
+  workflow_call:
+    inputs:
+      mirror_host:
+        type: string
+        default: ${{ vars.NR_GIT_HOST }}
+      # Where to push the repo to (without the git suffic)
+      # If not specified then the current repo name is used.
+      mirror_repo:
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  mirror:
+    if: github.event_name == 'push'
+    runs-on: self-hosted
+    container:
+      image: ${{ vars.SELF_HOSTED_RUNNER_IMAGE }}
+
+    steps:
+    - name: Checkout source repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0   # Required for full mirror including history and tags
+        # Installs LFS in the build environment
+        lfs: true
+        
+    # Git complains about directory permissions
+    - name: Disable safe directory
+      run: git config --global safe.directory '*'
+      
+    - name: Install SSH
+      run: apt-get update && apt-get install -y --no-install-recommends ssh
+
+    #
+    #  Pinned to a specific commit (currently v2.8.1) because this step
+    #  consumes the MIRROR_PUBLISH SSH key. THINK CAREFULLY before
+    #  bumping: any new version inherits the same secret exposure, so
+    #  audit the diff between commits before changing the SHA.
+    #
+    - name: Setup SSH key for mirroring
+      uses: shimataro/ssh-key-action@87a8f067114a8ce263df83e9ed5c849953548bc3
+      with:
+        key: ${{ secrets.MIRROR_PUBLISH }}
+        name: id_rsa-git
+        known_hosts: ${{ vars.NR_REPO_PUBLIC_KEY }}
+        config: |
+          Host ${{ vars.NR_GIT_HOST }}
+            User git
+            IdentityFile ~/.ssh/id_rsa-git
+
+    - name: Extract repo and branch
+      id: vars
+      run: |
+        echo "repo=${GITHUB_REPOSITORY##*/}" >> $GITHUB_OUTPUT
+        echo "branch=${GITHUB_REF##*/}" >> $GITHUB_OUTPUT
+
+    - name: Push to mirror
+      env:
+        REPO: ${{ steps.vars.outputs.repo }}
+        BRANCH: ${{ steps.vars.outputs.branch }}
+      run: |
+        REMOTE_PATH=${{ inputs.mirror_repo || steps.vars.outputs.repo }}
+        # Should not be necessary, but it seems some state is not being cleaned up
+        git remote remove mirror 2>/dev/null || true
+        git remote add mirror "git@${{ inputs.mirror_host }}:${REMOTE_PATH}.git"
+        git push --force mirror "$BRANCH:$BRANCH"

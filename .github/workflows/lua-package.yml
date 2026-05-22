@@ -1,0 +1,153 @@
+name: Lua Package
+
+on:
+  workflow_call:
+    inputs:
+      # Optional commands needed to generate .rockspec files
+      build_cmd:
+        type: string
+
+      # How many commits to pull down when checking out source
+      fetch_depth:
+        type: number
+        default: 0
+        
+      # A directory in the checked out repository containing the .rockspec files to build
+      working_directory:
+        type: string
+        default: '.'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: self-hosted
+    container:
+      image: ${{ vars.SELF_HOSTED_RUNNER_IMAGE }}
+
+    steps:
+    - name: Checkout source
+      uses: actions/checkout@v4
+      with:
+        path: src
+        # Set the number of commits we pull down
+        fetch-depth: ${{ inputs.FETCH_DEPTH }}
+        # Installs LFS in the build environment
+        lfs: true
+
+    # Git complains about directory permissions
+    # during build_cmd execution when we're attempting to
+    # determine the current tag if we don't disable safedirs
+    - name: Disable safe directory
+      run: git config --global safe.directory '*'
+
+    - name: Get latest release
+      id: get_release
+      uses: pozetroninc/github-action-get-latest-release@master
+      with:
+        repository: ${{ github.repository }} # e.g., owner/repo
+        excludes: prerelease, draft # Optional: exclude prereleases and drafts
+        token: ${{ secrets.GITHUB_TOKEN }} # GitHub token for authentication
+
+    # Sets the current VERSION using the tag version
+    - name: Set VERSION to the current ref
+      id: version
+      run: |
+        if [ "${GITHUB_REF}" = refs/tags/v* ]; then
+          echo "VERSION=${GITHUB_REF#refs/tags/v}-0" >> "$GITHUB_ENV"
+        elif [ "${GITHUB_REF}" = refs/tags/* ]; then
+          echo "VERSION=${GITHUB_REF#refs/tags/}-0" >> "$GITHUB_ENV"
+        else
+          # Incrementally depen the checkout until we get back to the release tage
+          # This lets us determine the commit depth since the last release
+          cd src
+          RELEASE="${{ steps.get_release.outputs.release }}"
+          while ! git rev-parse "$RELEASE" >/dev/null 2>&1; do git fetch --deepen=100 || break; done
+          echo "VERSION=${RELEASE#[!0-9]*}-$(git rev-list $RELEASE..HEAD --count 2>/dev/null || echo 0)" >> "$GITHUB_ENV"
+        fi
+      if: ${{ steps.get_release.outputs.release != '' }}
+
+    # If there have been no releases, use git commit depth i.e. 0.0-<depth>
+    - name: Set default version (no releases)
+      id: default-version
+      run: |
+        cd src/
+        git fetch --unshallow
+        echo "VERSION=0.0-$(git rev-list --count HEAD) >> "$GITHUB_ENV"
+      if: ${{ steps.get_release.outputs.release == '' }}
+        
+    - name: Set up Lua dependencies
+      run:
+        apt-get install -y unzip zip
+        
+    - name: Set up Lua
+      uses: leafo/gh-actions-lua@v10
+      with:
+        luaVersion: "5.4"  # or "luajit"
+
+    - name: Set up LuaRocks
+      uses: leafo/gh-actions-luarocks@v4
+      
+    - name: Run build_cmd (optional)
+      if: ${{ inputs.build_cmd != '' }}
+      run: |
+        cd src/${{ inputs.working_directory}}
+        eval "${{ inputs.build_cmd }}"
+
+    - name: Build package
+      run: |
+        cd src/${{ inputs.working_directory}}
+        for rockspec in *.rockspec; do
+          luarocks pack "$rockspec"
+        done
+        
+    - name: Install ssh
+      run: apt-get update && apt-get install -y --no-install-recommends ssh
+
+    #
+    #  Pinned to a specific commit (currently v2.8.1) because this step
+    #  consumes the LUAROCKS_PUBLISH SSH key. THINK CAREFULLY before
+    #  bumping: any new version inherits the same secret exposure, so
+    #  audit the diff between commits before changing the SHA.
+    #
+    - name: Setup SSH key for publising
+      uses: shimataro/ssh-key-action@87a8f067114a8ce263df83e9ed5c849953548bc3
+      with:
+        key: ${{ secrets.LUAROCKS_PUBLISH }}
+        name: id_rsa-git
+        known_hosts: ${{ vars.NR_REPO_PUBLIC_KEY }}
+        config: |
+          Host ${{ vars.NR_GIT_HOST }}
+            User git
+            IdentityFile ~/.ssh/id_rsa-git
+
+    - name: Checkout publishing repo
+      run: |
+        git config --global user.email "git@github.com"
+        git config --global user.name "Github Actions"
+        rm -rf publish 2>&1 > /dev/null || true
+        git clone -b master "git@${{ vars.NR_GIT_HOST }}:${{ vars.NR_LUAROCKS_PUBLISH_REPO }}" publish
+
+    # This only needs to be done if the repo is ever reinitialised
+    - name: Ensure publish directory exists
+      run: mkdir -p publish
+
+    - name: Copy packages to repo
+      run: |
+        cd "src/${{ inputs.working_directory}}"
+        cp *.rock "${GITHUB_WORKSPACE}/publish"
+
+    - name: Commit new package file
+      run: |
+        cd publish
+        git add *.rock
+        git commit -q -m "Github Actions auto commit $(date)" || true
+
+    - name: Push to luarocks repo
+      run: |
+        cd publish
+        git push origin
+
+    - name: Tidy up
+      run: rm -rf publish 2>&1 > /dev/null

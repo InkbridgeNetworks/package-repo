@@ -1,0 +1,163 @@
+name: Python Package
+
+on:
+  workflow_call:
+    inputs:
+      package_name:
+        required: true
+        type: string
+
+      # How many commits to pull down when checking out source
+      fetch_depth:
+        type: number
+        default: 0
+        
+      # A directory in the checked out repository containing the .rockspec files to build
+      working_directory:
+        type: string
+        default: '.'
+
+      # Project file to make substitutions in.  Substitutes @@VERSION@@ for the tag version.
+      project_file:
+        type: string
+        default: 'pyproject.toml'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: self-hosted
+    container:
+      image: ${{ vars.SELF_HOSTED_RUNNER_IMAGE }}
+
+    steps:
+    - name: Checkout source
+      uses: actions/checkout@v4
+      with:
+        path: src
+        # Set the number of commits we pull down
+        fetch-depth: ${{ inputs.FETCH_DEPTH }}
+        # Installs LFS in the build environment
+        lfs: true
+
+    # Git complains about directory permissions
+    # during build_cmd execution when we're attempting to
+    # determine the current tag if we don't disable safedirs
+    - name: Disable safe directory
+      run: git config --global safe.directory '*'
+
+    - name: Get latest release
+      id: get_release
+      uses: pozetroninc/github-action-get-latest-release@master
+      with:
+        repository: ${{ github.repository }} # e.g., owner/repo
+        excludes: prerelease, draft # Optional: exclude prereleases and drafts
+        token: ${{ secrets.GITHUB_TOKEN }} # GitHub token for authentication
+
+    # Sets the current VERSION using the tag version
+    - name: Set VERSION to the current ref
+      id: version
+      run: |
+        case "$GITHUB_REF" in
+          refs/tags/v*)
+            VERSION=${GITHUB_REF#refs/tags/v}
+            ;;
+          refs/tags/*)
+            VERSION=${GITHUB_REF#refs/tags/}
+            ;;
+          *)
+            # Incrementally deepen the checkout until we reach the release tag
+            cd src
+            RELEASE="${{ steps.get_release.outputs.release }}"
+            while ! git rev-parse "$RELEASE" >/dev/null 2>&1; do
+              git fetch --deepen=100 || break
+            done
+            DEPTH=$(git rev-list "$RELEASE"..HEAD --count 2>/dev/null || echo 0)
+            VERSION=${RELEASE#[!0-9]*}.dev${DEPTH}
+            ;;
+        esac
+        echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+      if: ${{ steps.get_release.outputs.release != '' }}
+
+    # If there have been no releases, use git commit depth i.e. 0.0-<depth>
+    - name: Set default version (no releases)
+      id: default-version
+      run: |
+        cd src/
+        git fetch --unshallow
+        echo "VERSION=0.0.dev$(git rev-list --count HEAD) >> "$GITHUB_ENV"
+      if: ${{ steps.get_release.outputs.release == '' }}
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install build
+
+    - name: Substitute version marker in pyproject.toml (if it exists)
+      run: |
+        cd src/${{ inputs.working_directory }}
+        if [ -e "${{ inputs.project_file }}" ]; then
+          sed -i "s/@@VERSION@@/${VERSION}/" "${{ inputs.project_file }}"
+        fi
+
+    - name: Build package
+      run: |
+        cd src/${{ inputs.working_directory}}
+        python -m build
+
+    - name: Install ssh
+      run: apt-get update && apt-get install -y --no-install-recommends ssh
+
+    #
+    #  Pinned to a specific commit (currently v2.8.1) because this step
+    #  consumes the PYPI_PUBLISH SSH key. THINK CAREFULLY before bumping:
+    #  any new version inherits the same secret exposure, so audit the
+    #  diff between commits before changing the SHA.
+    #
+    - name: Setup SSH key for publising
+      uses: shimataro/ssh-key-action@87a8f067114a8ce263df83e9ed5c849953548bc3
+      with:
+        key: ${{ secrets.PYPI_PUBLISH }}
+        name: id_rsa-git
+        known_hosts: ${{ vars.NR_REPO_PUBLIC_KEY }}
+        config: |
+          Host ${{ vars.NR_GIT_HOST }}
+            User git
+            IdentityFile ~/.ssh/id_rsa-git
+
+    - name: Checkout publishing repo
+      run: |
+        git config --global user.email "git@github.com"
+        git config --global user.name "Github Actions"
+        rm -rf publish 2>&1 > /dev/null || true
+        git clone -b master "git@${{ vars.NR_GIT_HOST }}:${{ vars.NR_PYPI_PUBLISH_REPO }}" publish
+
+    - name: Ensure project directory exists
+      run: mkdir -p publish/${{ inputs.package_name }}
+
+    - name: Copy tar.gz to repo
+      run: |
+        topdir=`pwd`
+        cd src/${{ inputs.working_directory}}/dist
+        echo "PKG_FILE=`ls *.tar.gz`" >> "$GITHUB_ENV"
+        cp *.tar.gz $topdir/publish/${{ inputs.package_name }}
+
+    - name: Commit new package file
+      run: |
+        cd publish
+        git add ${{ inputs.package_name }}/$PKG_FILE
+        git commit -q -m "Github Actions auto commit $(date)" || true
+
+    - name: Push to pypi repo
+      run: |
+        cd publish
+        git push origin
+
+    - name: Tidy up
+      run: rm -rf publish 2>&1 > /dev/null
