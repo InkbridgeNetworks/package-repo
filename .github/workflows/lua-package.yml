@@ -53,19 +53,32 @@ jobs:
     # Sets the current VERSION using the tag version
     - name: Set VERSION to the current ref
       id: version
+      env:
+        # On a workflow_run trigger github.ref is the default branch, not the
+        # ref that triggered the upstream run. The triggering ref (the tag, for
+        # a release) is carried in workflow_run.head_branch as the short tag
+        # name. A reusable workflow inherits the caller's github context, so
+        # this resolves whether lua-package.yml is called directly on a tag
+        # push or indirectly from a workflow_run-triggered caller.
+        TRIGGER_REF: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || github.ref }}
+        RELEASE: ${{ steps.get_release.outputs.release }}
       run: |
-        if [ "${GITHUB_REF}" = refs/tags/v* ]; then
-          echo "VERSION=${GITHUB_REF#refs/tags/v}-0" >> "$GITHUB_ENV"
-        elif [ "${GITHUB_REF}" = refs/tags/* ]; then
-          echo "VERSION=${GITHUB_REF#refs/tags/}-0" >> "$GITHUB_ENV"
-        else
-          # Incrementally depen the checkout until we get back to the release tage
-          # This lets us determine the commit depth since the last release
-          cd src
-          RELEASE="${{ steps.get_release.outputs.release }}"
-          while ! git rev-parse "$RELEASE" >/dev/null 2>&1; do git fetch --deepen=100 || break; done
-          echo "VERSION=${RELEASE#[!0-9]*}-$(git rev-list $RELEASE..HEAD --count 2>/dev/null || echo 0)" >> "$GITHUB_ENV"
-        fi
+        # case does glob matching; POSIX [ = ] is string equality, so the old
+        # `[ "$GITHUB_REF" = refs/tags/v* ]` never matched a real tag ref.
+        case "$TRIGGER_REF" in
+          refs/tags/v*) echo "VERSION=${TRIGGER_REF#refs/tags/v}-0" >> "$GITHUB_ENV" ;;
+          refs/tags/*)  echo "VERSION=${TRIGGER_REF#refs/tags/}-0" >> "$GITHUB_ENV" ;;
+          v[0-9]*)      echo "VERSION=${TRIGGER_REF#v}-0" >> "$GITHUB_ENV" ;;
+          [0-9]*)       echo "VERSION=${TRIGGER_REF}-0" >> "$GITHUB_ENV" ;;
+          *)
+            # Not a release ref: version as <last release>-<commits since>.
+            # Deepen the checkout until the release tag is reachable so
+            # git rev-list can count the commits since.
+            cd src
+            while ! git rev-parse "$RELEASE" >/dev/null 2>&1; do git fetch --deepen=100 || break; done
+            echo "VERSION=${RELEASE#[!0-9]*}-$(git rev-list "$RELEASE"..HEAD --count 2>/dev/null || echo 0)" >> "$GITHUB_ENV"
+            ;;
+        esac
       if: ${{ steps.get_release.outputs.release != '' }}
 
     # If there have been no releases, use git commit depth i.e. 0.0-<depth>
@@ -74,7 +87,7 @@ jobs:
       run: |
         cd src/
         git fetch --unshallow
-        echo "VERSION=0.0-$(git rev-list --count HEAD) >> "$GITHUB_ENV"
+        echo "VERSION=0.0-$(git rev-list --count HEAD)" >> "$GITHUB_ENV"
       if: ${{ steps.get_release.outputs.release == '' }}
         
     - name: Set up Lua dependencies
