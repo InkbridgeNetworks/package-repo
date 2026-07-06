@@ -63,19 +63,22 @@ jobs:
             User git
             IdentityFile ~/.ssh/id_rsa-git
 
-    - name: Extract repo and branch
+    - name: Extract repo name
       id: vars
       run: |
         echo "repo=${GITHUB_REPOSITORY##*/}" >> $GITHUB_OUTPUT
-        echo "branch=${GITHUB_REF##*/}" >> $GITHUB_OUTPUT
 
+    #
+    #  GITHUB_REF is the fully qualified ref that was pushed:
+    #  refs/heads/x mirrors the branch, refs/tags/x mirrors the tag
+    #  (annotated tag objects included). Slashed branch names like
+    #  feature/foo pass through intact, and checkout pinned the ref
+    #  at the triggering commit, so the mirror gets exactly that.
+    #
     - name: Push to mirror
-      env:
-        REPO: ${{ steps.vars.outputs.repo }}
-        BRANCH: ${{ steps.vars.outputs.branch }}
       run: |
         REMOTE_PATH=${{ inputs.mirror_repo || steps.vars.outputs.repo }}
         # Should not be necessary, but it seems some state is not being cleaned up
         git remote remove mirror 2>/dev/null || true
         git remote add mirror "git@${{ inputs.mirror_host }}:${REMOTE_PATH}.git"
-        git push --force mirror "$BRANCH:$BRANCH"
+        git push --force mirror "${GITHUB_REF}:${GITHUB_REF}"
