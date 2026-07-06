@@ -17,6 +17,16 @@ permissions:
 jobs:
   mirror:
     if: github.event_name == 'push'
+    #
+    #  Two pushes to the same branch in quick succession start two
+    #  mirror runs which race each other. The loser dies with
+    #  "cannot lock ref", and if the OLDER commit's run wins the race
+    #  it force-pushes the mirror backwards. Serialise per branch and
+    #  cancel the superseded run: the newest push always wins.
+    #
+    concurrency:
+      group: mirror-${{ github.repository }}-${{ github.ref }}
+      cancel-in-progress: true
     runs-on: self-hosted
     container:
       image: ${{ vars.SELF_HOSTED_RUNNER_IMAGE }}
